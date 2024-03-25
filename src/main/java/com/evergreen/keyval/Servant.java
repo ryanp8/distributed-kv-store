@@ -27,14 +27,12 @@ public class Servant extends Node {
                 try {
                     final byte[] value = this.db.get(key.getBytes());
                     if (value == null) {
-                        ctx.result("");
                         ctx.status(404);
                     } else {
                         ctx.result(value);
                         ctx.status(200);
                     }
                 } catch (RocksDBException e) {
-                    ctx.result("");
                     ctx.status(500);
                 }
             };
@@ -54,7 +52,6 @@ public class Servant extends Node {
                     ctx.result(value);
                     ctx.status(200);
                 } catch (RocksDBException e) {
-                    ctx.result("");
                     ctx.status(500);
                 }
             };
@@ -72,7 +69,6 @@ public class Servant extends Node {
                     this.db.delete(key.getBytes());
                     ctx.status(200);
                 } catch (RocksDBException e) {
-                    ctx.result("");
                     ctx.status(500);
                 }
             };
