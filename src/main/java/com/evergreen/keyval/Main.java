@@ -10,7 +10,6 @@ public class Main {
             int port = Integer.parseInt(args[1]);
             Node servant = new Servant(port);
         } else if (args[0].equals("coordinator")) {
-
             Node coordinator = new Coordinator(8080, Arrays.copyOfRange(args,1, args.length));
         }
     }
