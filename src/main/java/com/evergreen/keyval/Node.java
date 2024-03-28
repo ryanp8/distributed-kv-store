@@ -10,7 +10,6 @@ import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.http.HttpClient;
-import java.net.http.HttpHeaders;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
@@ -32,24 +31,21 @@ public class Node {
     private final DBClient db;
     private final long id;
 
-    private final ReadWriteLock lock;
-    private final Lock writeLock;
-    private final Lock readLock;
-
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     private long nodesUpdatedTime;
 
     public Node(String hostname, int port, String[] nodes) {
         Javalin app = Javalin.create()
-                        .get("/db/{key}", this.handleClientGet())
-                        .post("/db/{key}", this.handleClientPost())
-                        .delete("/db/{key}", this.handleClientDelete())
-                        .get("/nodes", this.handleGetNodes())
-                        .post("/nodes", this.handleAddNode())
-                        .get("/{key}", this.handleDirectGet())
-                        .post("/{key}", this.handleDirectPost())
-                        .delete("/{key}", this.handleDirectDelete());
+                .get("/db/{key}", this.handleClientGet())
+                .post("/db/{key}", this.handleClientPost())
+                .delete("/db/{key}", this.handleClientDelete())
+                .get("/nodes", this.handleNodesGet())
+                .post("/nodes", this.handleAllNodesPost())
+                .post("/node", this.handleNodePost())
+                .get("/{key}", this.handleDirectGet())
+                .post("/{key}", this.handleDirectPost())
+                .delete("/{key}", this.handleDirectDelete());
         app.start(port);
 
 
@@ -71,16 +67,12 @@ public class Node {
         this.nodesUpdatedTime = Instant.now().toEpochMilli();
 
         this.REPLICAS = Math.min(3, nodeIds.size());
-        this.lock = new ReentrantReadWriteLock();
-        this.writeLock = this.lock.writeLock();
-        this.readLock = this.lock.readLock();
 
         TimerTask pollNodes = new TimerTask() {
             @Override
             public void run() {
                 int targetNodeIdx = (int) (Math.random() * Node.this.nodes.size());
                 String urlString = String.format("http://%s/nodes", Node.this.nodeIdToAddress.get(Node.this.nodes.toArray(new Long[0])[targetNodeIdx]));
-                System.out.println(Node.this.nodeIdToAddress);
                 try {
                     HttpRequest request = HttpRequest.newBuilder()
                             .uri(new URI(urlString))
@@ -98,10 +90,22 @@ public class Node {
                                 Node.this.nodeIdToAddress = objectMapper.readValue(responseJson, new TypeReference<>() {
                                 });
                                 Node.this.nodes = new PriorityQueue<>(nodeIdToAddress.keySet());
+                                Node.this.nodesUpdatedTime = Instant.now().toEpochMilli();
                             }
-                            Node.this.nodesUpdatedTime = Instant.now().toEpochMilli();
                         }
                     }
+
+                    String jsonString = objectMapper.writeValueAsString(Node.this.nodeIdToAddress);
+                    request = HttpRequest.newBuilder()
+                            .uri(new URI(urlString))
+                            .POST(HttpRequest.BodyPublishers.ofString(jsonString))
+                            .header("Last-Modified", String.valueOf(Node.this.nodesUpdatedTime))
+                            .build();
+                    HttpClient.newBuilder()
+                            .build()
+                            .send(request, HttpResponse.BodyHandlers.ofString());
+                    System.out.println(Node.this.nodeIdToAddress);
+
                 } catch (InterruptedException | IOException e) {
                     throw new RuntimeException(e);
                 } catch (URISyntaxException e) {
@@ -110,7 +114,7 @@ public class Node {
             }
         };
         Timer timer = new Timer();
-        timer.scheduleAtFixedRate(pollNodes, 5000,1000);
+        timer.scheduleAtFixedRate(pollNodes, 3000,1000);
     }
 
     private long calculateID(String key) {
@@ -331,16 +335,36 @@ public class Node {
     }
 
     // curl http://localhost:3000/addNode -X POST -d localhost:3001
-    private Handler handleAddNode() {
+    private Handler handleNodePost() {
         return ctx -> {
             String address = ctx.body();
             long id = this.calculateID(address);
             this.nodes.add(id);
             this.nodeIdToAddress.put(id, address);
+            this.nodesUpdatedTime = Instant.now().toEpochMilli();
         };
     }
 
-    private Handler handleGetNodes() {
+    private Handler handleAllNodesPost() {
+        return ctx -> {
+            String lastModifiedHeader = ctx.header("Last-Modified");
+            String jsonString = ctx.body();
+            if (lastModifiedHeader != null) {
+                long lastModified = Long.parseLong(lastModifiedHeader);
+                synchronized (Node.this) {
+                    if (lastModified > Node.this.nodesUpdatedTime || lastModified == 0) {
+                        Node.this.nodeIdToAddress = objectMapper.readValue(jsonString, new TypeReference<>() {
+                        });
+                        Node.this.nodes = new PriorityQueue<>(nodeIdToAddress.keySet());
+                        Node.this.nodesUpdatedTime = Instant.now().toEpochMilli();
+                    }
+                }
+            }
+            ctx.status(200);
+        };
+    }
+
+    private Handler handleNodesGet() {
         try {
             return ctx -> {
                 String jsonString = objectMapper.writeValueAsString(this.nodeIdToAddress);
