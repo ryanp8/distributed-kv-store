@@ -18,9 +18,6 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.*;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class Node {
 
@@ -30,11 +27,8 @@ public class Node {
     private HashMap<Long, String> nodeIdToAddress;
     private final DBClient db;
     private final long id;
-
     private final ObjectMapper objectMapper = new ObjectMapper();
-
     private long nodesUpdatedTime;
-
     private final HttpClient httpClient = HttpClient.newHttpClient();
 
     public Node(String hostname, int port, String[] nodes) {
@@ -74,8 +68,8 @@ public class Node {
             @Override
             public void run() {
                 int targetNodeIdx = (int) (Math.random() * Node.this.nodes.size());
-                String urlString = String.format("http://%s/nodes",
-                        Node.this.nodeIdToAddress.get(Node.this.nodes.toArray(new Long[0])[targetNodeIdx]));
+                long targetNode = Node.this.nodes.toArray(new Long[0])[targetNodeIdx];
+                String urlString = String.format("http://%s/nodes", Node.this.nodeIdToAddress.get(targetNode));
                 try {
                     // Exchange node information between two nodes. POST to the partner node and then GET from it
                     String jsonString = objectMapper.writeValueAsString(Node.this.nodeIdToAddress);
@@ -98,19 +92,13 @@ public class Node {
                     // Keep the node information that was updated more recently
                     if (lastModifiedHeader.isPresent()) {
                         long lastModified = Long.parseLong(lastModifiedHeader.get());
-                        synchronized (Node.this) {
-                            if (lastModified > Node.this.nodesUpdatedTime || lastModified == 0) {
-                                Node.this.nodeIdToAddress = objectMapper.readValue(responseJson,
-                                        new TypeReference<>() {});
-                                Node.this.nodes = new PriorityQueue<>(nodeIdToAddress.keySet());
-                                Node.this.nodesUpdatedTime = Instant.now().toEpochMilli();
-                            }
-                        }
+                        Node.this.updateMembership(responseJson, lastModified);
                     }
                     Node.this.replicas = Math.min(3, Node.this.nodes.size());
 
                 } catch (InterruptedException | IOException e) {
-                    throw new RuntimeException(e);
+                    Node.this.deleteNode(targetNode);
+                    System.err.printf("Node at %s was removed from the ring\n", Node.this.nodeIdToAddress.get(targetNode));
                 } catch (URISyntaxException e) {
                     System.err.printf("Unable to create URI %s\n", urlString);
                 }
@@ -154,6 +142,24 @@ public class Node {
         return preferenceList;
     }
 
+    private synchronized void updateMembership(String membershipJson, long lastModified) {
+        if (lastModified > Node.this.nodesUpdatedTime || lastModified == 0) {
+            try {
+                this.nodeIdToAddress = objectMapper.readValue(membershipJson,
+                        new TypeReference<>() {});
+                this.nodes = new PriorityQueue<>(nodeIdToAddress.keySet());
+                this.nodesUpdatedTime = Instant.now().toEpochMilli();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    private synchronized void deleteNode(long nodeId) {
+        this.nodeIdToAddress.remove(nodeId);
+        this.nodes.remove(nodeId);
+    }
+
     private void recursiveGet(Context ctx, String key, List<String> nodes, int step) {
         String node = nodes.get(step);
         String urlString = String.format("http://%s/%s", node, key);
@@ -189,9 +195,6 @@ public class Node {
                 final byte[] val = this.db.get(key);
                 if (val == null) {
                     List<Long> preferenceList = this.calculatePreferenceList(key);
-                    System.out.println("PREFERENCE LIST:");
-                    System.out.println(preferenceList);
-                    System.out.println(this.nodeIdToAddress);
                     List<String> preferenceAddresses = preferenceList.stream().map(nodeIdToAddress::get).toList();
                     this.recursiveGet(ctx, key, preferenceAddresses.subList(1, preferenceAddresses.size()), 0);
                 } else {
@@ -348,20 +351,21 @@ public class Node {
         };
     }
 
+    private Handler handleNodeDelete() {
+        return ctx -> {
+            String address = ctx.body();
+            long id = this.calculateID(address);
+            this.deleteNode(id);
+        };
+    }
+
     private Handler handleAllNodesPost() {
         return ctx -> {
             String lastModifiedHeader = ctx.header("Last-Modified");
             String jsonString = ctx.body();
             if (lastModifiedHeader != null) {
                 long lastModified = Long.parseLong(lastModifiedHeader);
-                synchronized (Node.this) {
-                    if (lastModified > Node.this.nodesUpdatedTime || lastModified == 0) {
-                        Node.this.nodeIdToAddress = objectMapper.readValue(jsonString, new TypeReference<>() {
-                        });
-                        Node.this.nodes = new PriorityQueue<>(nodeIdToAddress.keySet());
-                        Node.this.nodesUpdatedTime = Instant.now().toEpochMilli();
-                    }
-                }
+                this.updateMembership(jsonString, lastModified);
             }
             ctx.status(200);
         };
