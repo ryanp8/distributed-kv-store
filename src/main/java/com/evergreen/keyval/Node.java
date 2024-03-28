@@ -77,14 +77,25 @@ public class Node {
                 String urlString = String.format("http://%s/nodes",
                         Node.this.nodeIdToAddress.get(Node.this.nodes.toArray(new Long[0])[targetNodeIdx]));
                 try {
-                    HttpRequest request = HttpRequest.newBuilder()
+                    // Exchange node information between two nodes. POST to the partner node and then GET from it
+                    String jsonString = objectMapper.writeValueAsString(Node.this.nodeIdToAddress);
+                    HttpRequest postNodesRequest = HttpRequest.newBuilder()
+                            .uri(new URI(urlString))
+                            .header("Last-Modified", String.valueOf(Node.this.nodesUpdatedTime))
+                            .POST(HttpRequest.BodyPublishers.ofString(jsonString))
+                            .build();
+                    Node.this.httpClient.send(postNodesRequest, HttpResponse.BodyHandlers.ofString());
+
+                    HttpRequest getNodesRequest = HttpRequest.newBuilder()
                             .uri(new URI(urlString))
                             .GET()
                             .build();
                     HttpResponse<String> response = Node.this.httpClient
-                            .send(request, HttpResponse.BodyHandlers.ofString());
+                            .send(getNodesRequest, HttpResponse.BodyHandlers.ofString());
                     String responseJson = response.body();
                     Optional<String> lastModifiedHeader = response.headers().firstValue("Last-Modified");
+
+                    // Keep the node information that was updated more recently
                     if (lastModifiedHeader.isPresent()) {
                         long lastModified = Long.parseLong(lastModifiedHeader.get());
                         synchronized (Node.this) {
@@ -96,15 +107,6 @@ public class Node {
                             }
                         }
                     }
-
-                    String jsonString = objectMapper.writeValueAsString(Node.this.nodeIdToAddress);
-                    request = HttpRequest.newBuilder()
-                            .uri(new URI(urlString))
-                            .header("Last-Modified", String.valueOf(Node.this.nodesUpdatedTime))
-                            .POST(HttpRequest.BodyPublishers.ofString(jsonString))
-                            .build();
-                    Node.this.httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-                    System.out.println(Node.this.nodeIdToAddress);
                     Node.this.replicas = Math.min(3, Node.this.nodes.size());
 
                 } catch (InterruptedException | IOException e) {
