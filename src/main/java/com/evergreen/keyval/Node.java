@@ -24,7 +24,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class Node {
 
-    private final int REPLICAS;
+    private int replicas;
     private MessageDigest md;
     private PriorityQueue<Long> nodes;
     private HashMap<Long, String> nodeIdToAddress;
@@ -34,6 +34,8 @@ public class Node {
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     private long nodesUpdatedTime;
+
+    private final HttpClient httpClient = HttpClient.newHttpClient();
 
     public Node(String hostname, int port, String[] nodes) {
         Javalin app = Javalin.create()
@@ -66,20 +68,20 @@ public class Node {
         this.nodes = new PriorityQueue<>(nodeIds);
         this.nodesUpdatedTime = Instant.now().toEpochMilli();
 
-        this.REPLICAS = Math.min(3, nodeIds.size());
+        this.replicas = Math.min(3, nodeIds.size());
 
         TimerTask pollNodes = new TimerTask() {
             @Override
             public void run() {
                 int targetNodeIdx = (int) (Math.random() * Node.this.nodes.size());
-                String urlString = String.format("http://%s/nodes", Node.this.nodeIdToAddress.get(Node.this.nodes.toArray(new Long[0])[targetNodeIdx]));
+                String urlString = String.format("http://%s/nodes",
+                        Node.this.nodeIdToAddress.get(Node.this.nodes.toArray(new Long[0])[targetNodeIdx]));
                 try {
                     HttpRequest request = HttpRequest.newBuilder()
                             .uri(new URI(urlString))
                             .GET()
                             .build();
-                    HttpResponse<String> response = HttpClient.newBuilder()
-                            .build()
+                    HttpResponse<String> response = Node.this.httpClient
                             .send(request, HttpResponse.BodyHandlers.ofString());
                     String responseJson = response.body();
                     Optional<String> lastModifiedHeader = response.headers().firstValue("Last-Modified");
@@ -87,8 +89,8 @@ public class Node {
                         long lastModified = Long.parseLong(lastModifiedHeader.get());
                         synchronized (Node.this) {
                             if (lastModified > Node.this.nodesUpdatedTime || lastModified == 0) {
-                                Node.this.nodeIdToAddress = objectMapper.readValue(responseJson, new TypeReference<>() {
-                                });
+                                Node.this.nodeIdToAddress = objectMapper.readValue(responseJson,
+                                        new TypeReference<>() {});
                                 Node.this.nodes = new PriorityQueue<>(nodeIdToAddress.keySet());
                                 Node.this.nodesUpdatedTime = Instant.now().toEpochMilli();
                             }
@@ -98,13 +100,12 @@ public class Node {
                     String jsonString = objectMapper.writeValueAsString(Node.this.nodeIdToAddress);
                     request = HttpRequest.newBuilder()
                             .uri(new URI(urlString))
-                            .POST(HttpRequest.BodyPublishers.ofString(jsonString))
                             .header("Last-Modified", String.valueOf(Node.this.nodesUpdatedTime))
+                            .POST(HttpRequest.BodyPublishers.ofString(jsonString))
                             .build();
-                    HttpClient.newBuilder()
-                            .build()
-                            .send(request, HttpResponse.BodyHandlers.ofString());
+                    Node.this.httpClient.send(request, HttpResponse.BodyHandlers.ofString());
                     System.out.println(Node.this.nodeIdToAddress);
+                    Node.this.replicas = Math.min(3, Node.this.nodes.size());
 
                 } catch (InterruptedException | IOException e) {
                     throw new RuntimeException(e);
@@ -144,7 +145,7 @@ public class Node {
 
         ArrayList<Long> preferenceList = new ArrayList<>();
         int nodesAdded = 0;
-        while (nodesAdded < this.REPLICAS) {
+        while (nodesAdded < this.replicas) {
             preferenceList.add(nodes[(start + nodesAdded) % nodes.length]);
             nodesAdded++;
         }
@@ -159,8 +160,7 @@ public class Node {
                     .uri(new URI(urlString))
                     .GET()
                     .build();
-            HttpResponse<String> response = HttpClient.newBuilder()
-                    .build()
+            HttpResponse<String> response = this.httpClient
                     .send(request, HttpResponse.BodyHandlers.ofString());
             String value = response.body();
             if (value == null) {
@@ -187,6 +187,9 @@ public class Node {
                 final byte[] val = this.db.get(key);
                 if (val == null) {
                     List<Long> preferenceList = this.calculatePreferenceList(key);
+                    System.out.println("PREFERENCE LIST:");
+                    System.out.println(preferenceList);
+                    System.out.println(this.nodeIdToAddress);
                     List<String> preferenceAddresses = preferenceList.stream().map(nodeIdToAddress::get).toList();
                     this.recursiveGet(ctx, key, preferenceAddresses.subList(1, preferenceAddresses.size()), 0);
                 } else {
@@ -216,8 +219,7 @@ public class Node {
                                 .uri(new URI(urlString))
                                 .POST(HttpRequest.BodyPublishers.ofString(postValue))
                                 .build();
-                        HttpResponse<String> response = HttpClient.newBuilder()
-                                .build()
+                        HttpResponse<String> response = this.httpClient
                                 .send(request, HttpResponse.BodyHandlers.ofString());
                         String responseValue = response.body();
                         if (responseValue == null) {
@@ -254,8 +256,7 @@ public class Node {
                                 .uri(new URI(urlString))
                                 .DELETE()
                                 .build();
-                        HttpResponse<String> response = HttpClient.newBuilder()
-                                .build()
+                        HttpResponse<String> response = this.httpClient
                                 .send(request, HttpResponse.BodyHandlers.ofString());
                         ctx.status(response.statusCode());
                     } catch (InterruptedException | IOException e) {
