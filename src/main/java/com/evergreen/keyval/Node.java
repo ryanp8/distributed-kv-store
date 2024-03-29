@@ -27,6 +27,7 @@ public class Node {
     private HashMap<Long, String> nodeIdToAddress;
     private final DBClient db;
     private final long id;
+    private final String address;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private long nodesUpdatedTime;
     private final HttpClient httpClient = HttpClient.newHttpClient();
@@ -38,7 +39,7 @@ public class Node {
                 .delete("/db/{key}", this.handleClientDelete())
                 .get("/nodes", this.handleNodesGet())
                 .post("/nodes", this.handleAllNodesPost())
-                .post("/node", this.handleNodePost())
+                .post("/ring", this.handleRingPost())
                 .get("/{key}", this.handleDirectGet())
                 .post("/{key}", this.handleDirectPost())
                 .delete("/{key}", this.handleDirectDelete());
@@ -51,7 +52,8 @@ public class Node {
             System.err.println("No algorithm MD5");
         }
         this.db = new DBClient(port);
-        this.id = this.calculateID(String.format("%s:%d", hostname, port));
+        this.address = String.format("%s:%d", hostname, port);
+        this.id = this.calculateID(this.address);
         this.nodeIdToAddress = new HashMap<>();
         ArrayList<Long> nodeIds = new ArrayList<>(Arrays.stream(nodes).map(this::calculateID).toList());
         nodeIds.add(this.id);
@@ -340,14 +342,26 @@ public class Node {
         }
     }
 
-    // curl http://localhost:3000/addNode -X POST -d localhost:3001
-    private Handler handleNodePost() {
+    // curl http://localhost:3000/ring -X POST -d localhost:3001
+    // joins the ring of the node provided in request body
+    private Handler handleRingPost() {
         return ctx -> {
+            // Get the other members of the ring from the current member we are using to join the ring
+            // Set the node's members to the members of the current node
             String address = ctx.body();
-            long id = this.calculateID(address);
-            this.nodes.add(id);
-            this.nodeIdToAddress.put(id, address);
-            this.nodesUpdatedTime = Instant.now().toEpochMilli();
+            HttpRequest getNodesRequest = HttpRequest.newBuilder()
+                    .uri(new URI(String.format("http://%s/nodes", address)))
+                    .GET()
+                    .build();
+            HttpResponse<String> response = Node.this.httpClient
+                    .send(getNodesRequest, HttpResponse.BodyHandlers.ofString());
+            String responseJson = response.body();
+            Node.this.updateMembership(responseJson, 0);
+
+            // Add the newly added node the membership data
+            // TODO: Should reconcile membership versions instead of just adding the new node
+            this.nodes.add(this.id);
+            this.nodeIdToAddress.put(this.id, this.address);
         };
     }
 
