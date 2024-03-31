@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.javalin.Javalin;
 import io.javalin.http.Context;
 import io.javalin.http.Handler;
+import org.rocksdb.RocksIterator;
 
 import java.io.IOException;
 import java.net.URI;
@@ -18,6 +19,8 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.*;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 public class Node {
 
@@ -40,6 +43,7 @@ public class Node {
                 .get("/nodes", this.handleNodesGet())
                 .post("/nodes", this.handleAllNodesPost())
                 .post("/ring", this.handleRingPost())
+                .get("/keys/{lowerBound}", this.handleRangeGet())
                 .get("/{key}", this.handleDirectGet())
                 .post("/{key}", this.handleDirectPost())
                 .delete("/{key}", this.handleDirectDelete());
@@ -64,7 +68,7 @@ public class Node {
         this.nodes = new PriorityQueue<>(nodeIds);
         this.nodesUpdatedTime = Instant.now().toEpochMilli();
 
-        this.replicas = Math.min(3, nodeIds.size());
+        this.replicas = Math.min(2, nodeIds.size());
 
         TimerTask pollNodes = new TimerTask() {
             @Override
@@ -96,11 +100,11 @@ public class Node {
                         long lastModified = Long.parseLong(lastModifiedHeader.get());
                         Node.this.updateMembership(responseJson, lastModified);
                     }
-                    Node.this.replicas = Math.min(3, Node.this.nodes.size());
+                    Node.this.replicas = Math.min(2, Node.this.nodes.size());
 
                 } catch (InterruptedException | IOException e) {
-                    Node.this.deleteNode(targetNode);
                     System.err.printf("Node at %s was removed from the ring\n", Node.this.nodeIdToAddress.get(targetNode));
+                    Node.this.deleteNode(targetNode);
                 } catch (URISyntaxException e) {
                     System.err.printf("Unable to create URI %s\n", urlString);
                 }
@@ -144,22 +148,89 @@ public class Node {
         return preferenceList;
     }
 
+    private void rebalanceOnAdd() {
+        Long[] nodes = this.nodes.toArray(new Long[0]);
+        int start = 0;
+        int end = nodes.length;
+        while (start < end) {
+            int mid = start + (end - start) / 2;
+            if (nodes[mid] > this.id) {
+                end = mid;
+            } else if (nodes[mid] < this.id) {
+                start = mid + 1;
+            } else {
+                start = mid;
+                break;
+            }
+        }
+
+        int prevNodeIdx = start - 1;
+        if (prevNodeIdx < 0) {
+            prevNodeIdx = nodes.length - 1;
+        }
+        long prevNodeId = nodes[prevNodeIdx];
+        String prevNodeAddress = this.nodeIdToAddress.get(prevNodeId);
+
+        int lowerNodeIdx = start - this.replicas;
+        if (lowerNodeIdx < 0) {
+            lowerNodeIdx = nodes.length - this.replicas + start;
+        }
+        long lowerBound = nodes[lowerNodeIdx];
+        try {
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(new URI(String.format("http://%s/keys/%d", prevNodeAddress, lowerBound)))
+                    .GET()
+                    .build();
+            HttpResponse<String> response = this.httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            HashMap<String, String> data = this.objectMapper.readValue(response.body(), new TypeReference<>() {});
+            for (String key : data.keySet()) {
+                this.db.post(key, data.get(key));
+            }
+
+        } catch (IOException | InterruptedException | URISyntaxException e) {
+            e.printStackTrace();
+        }
+    }
+
     private synchronized void updateMembership(String membershipJson, long lastModified) {
-        if (lastModified > Node.this.nodesUpdatedTime || lastModified == 0) {
+        if (lastModified > this.nodesUpdatedTime || lastModified == 0) {
             try {
-                this.nodeIdToAddress = objectMapper.readValue(membershipJson,
+                HashMap<Long, String> newNodes = objectMapper.readValue(membershipJson,
                         new TypeReference<>() {});
-                this.nodes = new PriorityQueue<>(nodeIdToAddress.keySet());
-                this.nodesUpdatedTime = Instant.now().toEpochMilli();
+                if (!newNodes.equals(this.nodeIdToAddress)) {
+                    Set<Long> combinedKeys = Stream.concat(newNodes.keySet().stream(),
+                                    this.nodeIdToAddress.keySet().stream())
+                            .collect(Collectors.toSet());
+                    this.nodes = new PriorityQueue<>(combinedKeys);
+                    for (Long key : newNodes.keySet()) {
+                        if (newNodes.get(key).isEmpty()) {
+                            this.nodes.remove(key);
+                        }
+                        this.nodeIdToAddress.put(key, newNodes.get(key));
+                    }
+                    this.nodesUpdatedTime = Instant.now().toEpochMilli();
+                }
             } catch (Exception e) {
                 e.printStackTrace();
             }
         }
     }
 
+    private Handler handleRangeGet() {
+        return ctx -> {
+            long lowerBound = Long.parseLong(ctx.pathParam("lowerBound"));
+            HashMap<String, String> result = this.db.lowerBoundGet(lowerBound);
+            String jsonString = objectMapper.writeValueAsString(result);
+            ctx.status(200);
+            ctx.result(jsonString);
+        };
+    }
+
+
     private synchronized void deleteNode(long nodeId) {
         this.nodeIdToAddress.remove(nodeId);
         this.nodes.remove(nodeId);
+        this.nodesUpdatedTime = Instant.now().toEpochMilli();
     }
 
     private void recursiveGet(Context ctx, String key, List<String> nodes, int step) {
@@ -356,12 +427,12 @@ public class Node {
             HttpResponse<String> response = Node.this.httpClient
                     .send(getNodesRequest, HttpResponse.BodyHandlers.ofString());
             String responseJson = response.body();
-            Node.this.updateMembership(responseJson, 0);
-
-            // Add the newly added node the membership data
-            // TODO: Should reconcile membership versions instead of just adding the new node
-            this.nodes.add(this.id);
-            this.nodeIdToAddress.put(this.id, this.address);
+            synchronized (this) {
+                this.updateMembership(responseJson, 0);
+                this.nodeIdToAddress.put(this.id, this.address);
+                this.nodes.add(this.id);
+            }
+            this.rebalanceOnAdd();
         };
     }
 
