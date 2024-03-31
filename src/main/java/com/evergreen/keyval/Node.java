@@ -27,6 +27,7 @@ public class Node {
     private int replicas;
     private MessageDigest md;
     private PriorityQueue<Long> nodes;
+    private Long[] nodesArray;
     private HashMap<Long, String> nodeIdToAddress;
     private final DBClient db;
     private final long id;
@@ -43,7 +44,9 @@ public class Node {
                 .get("/nodes", this.handleNodesGet())
                 .post("/nodes", this.handleAllNodesPost())
                 .post("/ring", this.handleRingPost())
-                .get("/keys/{lowerBound}", this.handleRangeGet())
+                .get("/keys", this.handleKeysGet())
+                .post("/keys", this.handleKeysPost())
+                .delete("/keys", this.handleKeysDelete())
                 .get("/{key}", this.handleDirectGet())
                 .post("/{key}", this.handleDirectPost())
                 .delete("/{key}", this.handleDirectDelete());
@@ -120,9 +123,9 @@ public class Node {
         return ByteBuffer.wrap(digest).getLong();
     }
 
-    private List<Long> calculatePreferenceList(String key) {
+    private long calculateNodeIdx(String nodeId) {
         Long[] nodes = this.nodes.toArray(new Long[0]);
-        long hash = this.calculateID(key);
+        long hash = this.calculateID(nodeId);
         int start = 0;
         int end = nodes.length;
         if (hash > nodes[end - 1]) {
@@ -133,16 +136,21 @@ public class Node {
                 } else if (nodes[mid] < hash) {
                     start = mid + 1;
                 } else {
-                    start = mid;
-                    break;
+                    return mid;
                 }
             }
         }
+        return start;
+    }
+
+    private List<Long> calculatePreferenceList(String key) {
+        Long[] nodes = this.nodes.toArray(new Long[0]);
+        long nodeIdx = this.calculateNodeIdx(key);
 
         ArrayList<Long> preferenceList = new ArrayList<>();
         int nodesAdded = 0;
         while (nodesAdded < this.replicas) {
-            preferenceList.add(nodes[(start + nodesAdded) % nodes.length]);
+            preferenceList.add(nodes[((int) nodeIdx + nodesAdded) % nodes.length]);
             nodesAdded++;
         }
         return preferenceList;
@@ -176,15 +184,26 @@ public class Node {
             lowerNodeIdx = nodes.length - this.replicas + start;
         }
         long lowerBound = nodes[lowerNodeIdx];
+
         try {
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(new URI(String.format("http://%s/keys/%d", prevNodeAddress, lowerBound)))
+            HttpRequest getKeysRequest = HttpRequest.newBuilder()
+                    .uri(new URI(String.format("http://%s/keys?lower=%d&upper=%d", prevNodeAddress, lowerBound, this.id)))
                     .GET()
                     .build();
-            HttpResponse<String> response = this.httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            HttpResponse<String> response = this.httpClient.send(getKeysRequest, HttpResponse.BodyHandlers.ofString());
             HashMap<String, String> data = this.objectMapper.readValue(response.body(), new TypeReference<>() {});
             for (String key : data.keySet()) {
                 this.db.post(key, data.get(key));
+            }
+
+            for (int i = 0; i < this.replicas; i++) {
+                long deleteUpperBound = nodes[(lowerNodeIdx + i + 1) % nodes.length];
+                String nodeAddress = this.nodeIdToAddress.get(nodes[(start + i + 1) % nodes.length]);
+                HttpRequest deleteKeysRequest = HttpRequest.newBuilder()
+                        .uri(new URI(String.format("http://%s/keys?upper=%d", nodeAddress, deleteUpperBound)))
+                        .DELETE()
+                        .build();
+                this.httpClient.send(deleteKeysRequest, HttpResponse.BodyHandlers.ofString());
             }
 
         } catch (IOException | InterruptedException | URISyntaxException e) {
@@ -216,13 +235,51 @@ public class Node {
         }
     }
 
-    private Handler handleRangeGet() {
+    private Handler handleKeysGet() {
         return ctx -> {
-            long lowerBound = Long.parseLong(ctx.pathParam("lowerBound"));
-            HashMap<String, String> result = this.db.lowerBoundGet(lowerBound);
-            String jsonString = objectMapper.writeValueAsString(result);
+            String lowerBound = ctx.queryParam("lower");
+            String upperBound = ctx.queryParam("upper");
+            String jsonString;
+            if (lowerBound != null && upperBound != null) {
+                HashMap<String, String> result = this.db.boundGet(
+                        Long.parseLong(lowerBound),
+                        Long.parseLong(upperBound));
+                jsonString = objectMapper.writeValueAsString(result);
+
+            } else {
+                HashMap<String, String> result = this.db.getAll();
+                jsonString = objectMapper.writeValueAsString(result);
+            }
             ctx.status(200);
             ctx.result(jsonString);
+        };
+    }
+
+    private Handler handleKeysPost() {
+        return ctx -> {
+            try {
+                String jsonString = ctx.body();
+                HashMap<String, String> data = this.objectMapper.readValue(jsonString,
+                        new TypeReference<>() {});
+                for (String key : data.keySet()) {
+                    this.db.post(key, data.get(key));
+                }
+                ctx.status(200);
+            } catch (Exception e) {
+                e.printStackTrace();
+                ctx.status(500);
+            }
+        };
+    }
+
+    private Handler handleKeysDelete() {
+        return ctx -> {
+            String lowerBound = ctx.queryParam("lower");
+            String upperBound = ctx.queryParam("upper");
+            if (upperBound != null) {
+                this.db.upperBoundDelete(Long.parseLong(upperBound));
+            }
+            ctx.status(200);
         };
     }
 

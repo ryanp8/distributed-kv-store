@@ -68,7 +68,7 @@ public class DBClient {
         while (iter.isValid()) {
             byte[] key = iter.key();
             byte[] digest = this.md.digest(key);
-            if (ByteBuffer.wrap(digest).getLong() < upperBound) {
+            if (ByteBuffer.wrap(digest).getLong() <= upperBound) {
                 String keyString = new String(key);
                 String val = new String(iter.value());
                 result.put(keyString, val);
@@ -76,6 +76,55 @@ public class DBClient {
             iter.next();
         }
         return result;
+    }
+
+    public HashMap<String, String> getAll() {
+        final RocksIterator iter = this.db.newIterator();
+        iter.seekToFirst();
+
+        HashMap<String, String> result = new HashMap<>();
+        while (iter.isValid()) {
+            byte[] key = iter.key();
+            String keyString = new String(key);
+            String val = new String(iter.value());
+            result.put(keyString, val);
+            iter.next();
+        }
+        return result;
+    }
+
+    public HashMap<String, String> boundGet(long lowerBound, long upperBound) {
+        final RocksIterator iter = this.db.newIterator();
+        iter.seekToFirst();
+
+        HashMap<String, String> result = new HashMap<>();
+        while (iter.isValid()) {
+            byte[] key = iter.key();
+            byte[] digest = this.md.digest(key);
+            long digestDec = ByteBuffer.wrap(digest).getLong();
+            if (digestDec <= upperBound && digestDec > lowerBound) {
+                String keyString = new String(key);
+                String val = new String(iter.value());
+                result.put(keyString, val);
+            }
+            iter.next();
+        }
+        return result;
+    }
+
+    public void deleteAll() {
+        final RocksIterator iter = this.db.newIterator();
+        iter.seekToFirst();
+
+        while (iter.isValid()) {
+            byte[] key = iter.key();
+            try {
+                this.db.delete(key);
+            } catch (RocksDBException e) {
+                e.printStackTrace();
+            }
+            iter.next();
+        }
     }
 
     public void lowerBoundDelete(long lowerBound) {
@@ -111,7 +160,6 @@ public class DBClient {
             byte[] digest = this.md.digest(key);
             if (ByteBuffer.wrap(digest).getLong() < upperBound) {
                 keys.add(key);
-
             }
             iter.next();
         }
